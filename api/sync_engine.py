@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 
@@ -13,26 +14,47 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 print("Loading ML Embedding Model (all-MiniLM-L6-v2)...")
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-def get_indian_movies(pages=20):
-    """Fetch many pages of Indian movies, including various regional languages"""
-    print(f"Fetching {pages} pages of Indian movies from TMDB...")
+def get_indian_movies(total_target=2100):
+    """Fetch a massive collection of Indian movies across regions to reach 2000+ rows"""
+    print(f"Targeting at least {total_target} Indian movies...")
     all_movies = []
     
-    # We use multiple languages to ensure we get a diverse set of regional content
-    languages = ['hi', 'te', 'ta', 'kn', 'ml', 'pa']
+    # Expanded language list to cover more regional markets
+    languages = ['hi', 'te', 'ta', 'kn', 'ml', 'pa', 'bn', 'mr']
     
+    # Calculate pages needed per language (approx 20 movies per page)
+    # We aim for ~270 movies per language to safely hit 2000+
+    pages_per_lang = (total_target // len(languages) // 20) + 5 
+
     for lang in languages:
-        for page in range(1, (pages // len(languages)) + 2):
+        print(f"Deep crawling movies for language: {lang}...")
+        for page in range(1, pages_per_lang + 1):
             try:
+                # We use sort_by=primary_release_date.desc to ensure we get "recent" movies first
                 url = (
                     f"https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}"
                     f"&region=IN&with_origin_country=IN&with_original_language={lang}"
-                    f"&sort_by=popularity.desc&include_adult=false&page={page}"
+                    f"&sort_by=primary_release_date.desc&include_adult=false&page={page}"
+                    f"&primary_release_year.gte=2000" # Focus on movies from the last 25 years
                 )
                 response = requests.get(url)
+                if response.status_code == 429: # Rate limit handling
+                    time.sleep(2)
+                    continue
+                
                 response.raise_for_status()
                 data = response.json()
-                all_movies.extend(data.get('results', []))
+                results = data.get('results', [])
+                
+                if not results:
+                    break # Stop if no more movies for this language
+                    
+                all_movies.extend(results)
+                
+                # Exit early if we've gathered enough candidates to process
+                if len(all_movies) > total_target + 500:
+                    break
+                    
             except Exception as e:
                 print(f"Error fetching {lang} movies page {page}: {e}")
                 continue
@@ -40,10 +62,11 @@ def get_indian_movies(pages=20):
     return all_movies
 
 def get_global_books():
-    """Fetch books from 12 diverse categories to maximize row count"""
+    """Fetch books from 15 diverse categories to maximize row count"""
     queries = [
         "fiction", "mystery", "history", "science", "biography", "thriller",
-        "philosophy", "technology", "romance", "fantasy", "business", "travel"
+        "philosophy", "technology", "romance", "fantasy", "business", "travel",
+        "self-help", "poetry", "art"
     ]
     all_books = []
     
@@ -65,17 +88,19 @@ def get_global_books():
 
 def run_sync():
     # --- Process Movies ---
-    # We are now aiming for ~300-400 movies
-    movies = get_indian_movies(pages=25) 
+    # Fetching a large batch to filter for quality (must have overview)
+    movie_candidates = get_indian_movies(total_target=2200) 
     synced_movies = 0
-    print(f"Total movie candidates fetched: {len(movies)}. Starting processing...")
+    print(f"Total movie candidates fetched: {len(movie_candidates)}. Starting vector processing...")
     
-    for m in movies:
+    for m in movie_candidates:
         try:
+            # Skip if no metadata exists for embedding
             if not m.get('overview') or not m.get('title'):
                 continue
                 
             text_content = f"{m['title']}. {m.get('overview', '')}"
+            # Embeddings are essential for the recommendation engine
             embedding = model.encode(text_content).tolist()
             
             movie_payload = {
@@ -90,15 +115,16 @@ def run_sync():
             }
             supabase.table("movies").upsert(movie_payload, on_conflict="tmdb_id").execute()
             synced_movies += 1
-            if synced_movies % 20 == 0:
-                print(f"Progress: {synced_movies} movies synced...")
+            
+            if synced_movies % 50 == 0:
+                print(f"Progress: {synced_movies} movies synced to database...")
+                
         except Exception as e:
             pass # Silent skip for malformed data
 
-    print(f"Successfully finished movie sync. Total: {synced_movies}")
+    print(f"Successfully finished movie sync. Total unique movies in DB: {synced_movies}")
 
     # --- Process Books ---
-    # Aiming for ~400+ books
     book_items = get_global_books()
     synced_books = 0
     print(f"Total book candidates fetched: {len(book_items)}. Starting processing...")
@@ -124,13 +150,13 @@ def run_sync():
             }
             supabase.table("books").upsert(book_payload, on_conflict="google_id").execute()
             synced_books += 1
-            if synced_books % 20 == 0:
+            if synced_books % 50 == 0:
                 print(f"Progress: {synced_books} books synced...")
         except Exception as e:
             pass
 
     print(f"Successfully finished book sync. Total: {synced_books}")
-    print("Full database update completed.")
+    print("Full database update completed. Ready for hybrid recommendation serving.")
 
 if __name__ == "__main__":
     if not all([TMDB_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
