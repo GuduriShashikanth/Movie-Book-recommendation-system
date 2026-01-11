@@ -1,8 +1,9 @@
---index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 supabase
 requests
 sentence-transformers
+torch
 python-dotenv
 pydantic
