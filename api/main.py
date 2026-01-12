@@ -42,28 +42,29 @@ app.add_middleware(
 
 def get_embedding(text: str):
     """
-    Calls Hugging Face Inference API for embeddings and flattens the result.
-    This ensures the vector is compatible with Supabase pgvector.
+    Calls Hugging Face Inference API for embeddings with aggressive retry logic.
+    Handles '503 Service Unavailable' by waiting for the model to warm up.
     """
     model_id = "sentence-transformers/all-MiniLM-L6-v2"
     api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_id}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
     
-    for i in range(3):
+    # Increased to 7 retries for a total possible wait time of ~90 seconds
+    for i in range(7):
         try:
-            # We add wait_for_model to ensure we don't get a 503 while it's loading
+            # wait_for_model: True tells HF to try and load it before responding
+            # timeout: 45s gives the model more time to finish initialization
             response = requests.post(
                 api_url, 
                 headers=headers, 
                 json={"inputs": text, "options": {"wait_for_model": True}}, 
-                timeout=20
+                timeout=45
             )
             
             if response.status_code == 200:
                 vector = response.json()
                 
                 # Logic to flatten nested arrays (HF often returns [[[...]]] for token embeddings)
-                # We need a flat list of 384 floats for the database.
                 if isinstance(vector, list):
                     while len(vector) > 0 and isinstance(vector[0], list):
                         vector = vector[0]
@@ -71,15 +72,18 @@ def get_embedding(text: str):
                 return vector
             
             elif response.status_code == 503:
-                logger.info(f"Hugging Face model warming up (Attempt {i+1}/3)...")
-                time.sleep(5)
+                # Exponential backoff: 5s, 10s, 15s, 20s...
+                wait_time = (i + 1) * 5
+                logger.info(f"AI Engine warming up (Attempt {i+1}/7). Waiting {wait_time}s...")
+                time.sleep(wait_time)
                 continue
             else:
                 logger.error(f"HF API Error: {response.status_code} - {response.text}")
                 break
         except Exception as e:
-            logger.error(f"Embedding Request Error: {e}")
-            time.sleep(1)
+            logger.error(f"Embedding Request Error on attempt {i+1}: {e}")
+            time.sleep(2)
+            
     return None
 
 @app.get("/")
@@ -88,6 +92,7 @@ async def health_check():
     return {
         "status": "online", 
         "database": "connected" if supabase else "error",
+        "ai_auth": "token_present" if HF_TOKEN else "no_token_warning",
         "environment": "production"
     }
 
@@ -101,18 +106,20 @@ async def semantic_search(
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase connection not established.")
     
-    try:
-        # Step 1: Get semantic vector
-        query_vector = get_embedding(q)
-        if not query_vector:
-            raise HTTPException(status_code=503, detail="AI Engine is busy. Please try again.")
+    # Step 1: Get semantic vector
+    query_vector = get_embedding(q)
+    
+    if not query_vector:
+        token_msg = " Ensure HF_TOKEN is correctly set in Koyeb." if not HF_TOKEN else ""
+        raise HTTPException(
+            status_code=533, # Custom code to indicate AI specifically is busy
+            detail=f"The AI engine is currently waking up. Please refresh in 15 seconds.{token_msg}"
+        )
 
-        # Step 2: Query Supabase using RPC
-        rpc_function = "match_movies" if type == "movie" else "match_books"
-        
-        # Log the call for debugging
-        logger.info(f"Calling RPC {rpc_function} with query: {q}")
-        
+    # Step 2: Query Supabase using RPC
+    rpc_function = "match_movies" if type == "movie" else "match_books"
+    
+    try:
         response = supabase.rpc(rpc_function, {
             "query_embedding": query_vector,
             "match_threshold": threshold,
@@ -122,12 +129,7 @@ async def semantic_search(
         return {"query": q, "type": type, "results": response.data}
     
     except Exception as e:
-        # Capture the actual error in the logs while returning a safe message to user
         logger.error(f"Search Execution Error: {str(e)}")
-        # Check if it's a specific Supabase function error
-        if "function" in str(e).lower() and "does not exist" in str(e).lower():
-            raise HTTPException(status_code=500, detail=f"Database error: RPC function {rpc_function} not found. Did you run setup_vector_search.sql?")
-        
         raise HTTPException(status_code=500, detail=f"Internal search error: {str(e)}")
 
 @app.get("/recommendations/content/{item_id}")

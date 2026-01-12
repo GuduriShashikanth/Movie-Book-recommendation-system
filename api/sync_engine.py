@@ -19,8 +19,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 
 def get_embedding(text: str):
     """
-    Calls Hugging Face Inference API for embeddings.
-    Replaces local ML libraries to stay under memory/storage limits.
+    Calls Hugging Face Inference API for embeddings with aggressive retry logic.
+    Ensures that large data syncs don't fail just because the model is cold.
     """
     if not HF_TOKEN:
         logger.error("HF_TOKEN is missing! Cannot generate embeddings.")
@@ -30,13 +30,14 @@ def get_embedding(text: str):
     api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_id}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     
-    for i in range(5):
+    # Increased to 7 retries for a total possible wait time of ~90 seconds
+    for i in range(7):
         try:
             response = requests.post(
                 api_url, 
                 headers=headers, 
                 json={"inputs": text, "options": {"wait_for_model": True}}, 
-                timeout=30
+                timeout=45
             )
             
             if response.status_code == 200:
@@ -48,15 +49,16 @@ def get_embedding(text: str):
                     return vector
                 return vector
             elif response.status_code == 503:
+                # Exponential backoff: 5s, 10s, 15s...
                 wait_time = (i + 1) * 5
-                logger.info(f"AI Engine warming up... waiting {wait_time}s")
+                logger.info(f"AI Engine warming up (Attempt {i+1}/7). Waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             else:
                 logger.error(f"HF Error: {response.status_code} - {response.text}")
                 break
         except Exception as e:
-            logger.error(f"Request Error: {e}")
+            logger.error(f"Embedding Request Error on attempt {i+1}: {e}")
             time.sleep(2)
     return None
 
