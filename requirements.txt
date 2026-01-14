@@ -8,6 +8,7 @@ python-dotenv
 pydantic
 pydantic[email]
 pyjwt
+bcrypt>=4.0.0
 passlib[bcrypt]
 python-multipart
 psutil
