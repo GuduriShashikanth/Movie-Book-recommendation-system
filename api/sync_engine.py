@@ -116,7 +116,7 @@ def get_indian_movies(total_target=10000):
 
 def get_global_books(total_target=5000):
     """Crawl global books across various categories and languages"""
-    logger.info(f"Targeting {total_target} books...")
+    logger.info(f"Targeting {total_target} English books...")
     all_books = []
     seen_ids = set()
     
@@ -127,7 +127,8 @@ def get_global_books(total_target=5000):
         "poetry", "drama", "adventure", "horror", "crime", "psychology",
         "art", "cooking", "travel", "health", "education", "religion",
         "politics", "economics", "sociology", "mathematics", "physics",
-        "literature", "classics", "contemporary", "young adult", "children"
+        "literature", "classics", "contemporary", "young adult", "children",
+        "sports", "music", "photography", "design", "engineering", "medicine"
     ]
     
     # Multiple search strategies
@@ -140,8 +141,8 @@ def get_global_books(total_target=5000):
         for order in order_types:
             logger.info(f"Crawling: {cat} ({order}, {lang})")
                 
-            # Fetch up to 200 books per category/order combination
-            for start in range(0, 200, 40):
+            # Fetch up to 400 books per category/order combination (increased from 200)
+            for start in range(0, 400, 40):
                 try:
                     params = {
                         'q': f'subject:{cat}',
@@ -149,7 +150,8 @@ def get_global_books(total_target=5000):
                         'maxResults': 40,
                         'startIndex': start,
                         'langRestrict': lang,
-                        'printType': 'books'
+                        'printType': 'books',
+                        'filter': 'ebooks'  # Focus on ebooks which have better metadata
                     }
                     
                     url = "https://www.googleapis.com/books/v1/volumes"
@@ -173,7 +175,7 @@ def get_global_books(total_target=5000):
                         logger.info(f"Target reached: {len(all_books)} books")
                         return all_books
                     
-                    time.sleep(0.5)  # Anti-throttle
+                    time.sleep(0.3)  # Reduced delay for faster fetching
                     
                 except Exception as e:
                     logger.error(f"Google Books Fetch Error: {e}")
