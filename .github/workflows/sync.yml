@@ -3,8 +3,17 @@ name: Daily Content Sync
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs at midnight UTC
-  workflow_dispatch: # Allows manual trigger
+    - cron: '0 0 * * *' # Runs at midnight UTC daily
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+    inputs:
+      movie_target:
+        description: 'Number of movies to fetch (default: 10000)'
+        required: false
+        default: '10000'
+      book_target:
+        description: 'Number of books to fetch (default: 5000)'
+        required: false
+        default: '5000'
 
 jobs:
   build_and_sync:
@@ -29,5 +38,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # The script remains in the api/ folder
+          MOVIE_TARGET: ${{ github.event.inputs.movie_target || '10000' }}
+          BOOK_TARGET: ${{ github.event.inputs.book_target || '5000' }}
         run: python api/sync_engine.py
+        timeout-minutes: 120  # 2 hour timeout for large syncs
