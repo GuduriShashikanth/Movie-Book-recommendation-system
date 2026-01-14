@@ -1,13 +1,12 @@
 import os
-import requests
-import time
 import logging
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-# Set up logging for better debugging in Koyeb
+# Set up logging for production debugging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -15,22 +14,31 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") 
-HF_TOKEN = os.getenv("HF_TOKEN", "") 
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Initialize Supabase with a safety check
+# 2. Initialize ML Model (Local Inference)
+# This replaces the Hugging Face API calls. 
+# It loads the 80MB model directly into your server's RAM.
+logger.info("Loading Local ML Model (all-MiniLM-L6-v2)...")
+try:
+    # We force CPU usage to stay within memory limits
+    model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+    logger.info("ML Model loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load ML Model: {e}")
+    model = None
+
+# 3. Initialize Supabase
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase client initialized successfully.")
+        logger.info("Supabase connection established.")
     except Exception as e:
-        logger.error(f"Supabase Initialization Error: {e}")
-else:
-    logger.error("CRITICAL: SUPABASE_URL or SUPABASE_KEY is missing from environment variables.")
+        logger.error(f"Supabase Connection Error: {e}")
 
-# 2. Initialize FastAPI
-app = FastAPI(title="CineLibre ML API - Production Ready")
+# 4. Initialize FastAPI
+app = FastAPI(title="CineLibre ML API - Local Inference Mode")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,60 +48,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_embedding(text: str):
-    """
-    Calls Hugging Face Inference API for embeddings with aggressive retry logic.
-    Handles '503 Service Unavailable' by waiting for the model to warm up.
-    """
-    model_id = "sentence-transformers/all-MiniLM-L6-v2"
-    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_id}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-    
-    # Increased to 7 retries for a total possible wait time of ~90 seconds
-    for i in range(7):
-        try:
-            # wait_for_model: True tells HF to try and load it before responding
-            # timeout: 45s gives the model more time to finish initialization
-            response = requests.post(
-                api_url, 
-                headers=headers, 
-                json={"inputs": text, "options": {"wait_for_model": True}}, 
-                timeout=45
-            )
-            
-            if response.status_code == 200:
-                vector = response.json()
-                
-                # Logic to flatten nested arrays (HF often returns [[[...]]] for token embeddings)
-                if isinstance(vector, list):
-                    while len(vector) > 0 and isinstance(vector[0], list):
-                        vector = vector[0]
-                    return vector
-                return vector
-            
-            elif response.status_code == 503:
-                # Exponential backoff: 5s, 10s, 15s, 20s...
-                wait_time = (i + 1) * 5
-                logger.info(f"AI Engine warming up (Attempt {i+1}/7). Waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"HF API Error: {response.status_code} - {response.text}")
-                break
-        except Exception as e:
-            logger.error(f"Embedding Request Error on attempt {i+1}: {e}")
-            time.sleep(2)
-            
-    return None
-
 @app.get("/")
 async def health_check():
-    """Health status endpoint for Koyeb monitoring"""
+    """Verify system status and memory health"""
     return {
-        "status": "online", 
-        "database": "connected" if supabase else "error",
-        "ai_auth": "token_present" if HF_TOKEN else "no_token_warning",
-        "environment": "production"
+        "status": "online",
+        "engine": "Local-Inference",
+        "model_loaded": model is not None,
+        "database": "connected" if supabase else "error"
     }
 
 @app.get("/search/semantic")
@@ -103,34 +65,35 @@ async def semantic_search(
     limit: int = 12,
     threshold: float = 0.4 
 ):
+    if not model:
+        raise HTTPException(status_code=503, detail="ML Model is still loading into RAM.")
     if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase connection not established.")
-    
-    # Step 1: Get semantic vector
-    query_vector = get_embedding(q)
-    
-    if not query_vector:
-        token_msg = " Ensure HF_TOKEN is correctly set in Koyeb." if not HF_TOKEN else ""
-        raise HTTPException(
-            status_code=533, # Custom code to indicate AI specifically is busy
-            detail=f"The AI engine is currently waking up. Please refresh in 15 seconds.{token_msg}"
-        )
-
-    # Step 2: Query Supabase using RPC
-    rpc_function = "match_movies" if type == "movie" else "match_books"
+        raise HTTPException(status_code=500, detail="Database connection missing.")
     
     try:
+        # Step 1: Generate Embedding Locally
+        # This is 100% reliable as it doesn't depend on external AI APIs
+        logger.info(f"Generating local embedding for query: {q}")
+        query_vector = model.encode(q).tolist()
+
+        # Step 2: Query Supabase using pgvector
+        rpc_function = "match_movies" if type == "movie" else "match_books"
+        
         response = supabase.rpc(rpc_function, {
             "query_embedding": query_vector,
             "match_threshold": threshold,
             "match_count": limit
         }).execute()
         
-        return {"query": q, "type": type, "results": response.data}
+        return {
+            "query": q,
+            "type": type,
+            "results": response.data
+        }
     
     except Exception as e:
-        logger.error(f"Search Execution Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal search error: {str(e)}")
+        logger.error(f"Search Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @app.get("/recommendations/content/{item_id}")
 async def get_content_recommendations(item_id: str, type: str = "movie", limit: int = 10):
@@ -140,6 +103,7 @@ async def get_content_recommendations(item_id: str, type: str = "movie", limit: 
         table = "movies" if type == "movie" else "books"
         rpc_function = "match_movies" if type == "movie" else "match_books"
         
+        # Fetch the pre-existing vector from the database
         item = supabase.table(table).select("embedding").eq("id", item_id).single().execute()
         if not item.data:
             raise HTTPException(status_code=404, detail="Item not found.")
@@ -150,6 +114,7 @@ async def get_content_recommendations(item_id: str, type: str = "movie", limit: 
             "match_count": limit + 1
         }).execute()
         
+        # Remove the source item itself from recommendations
         results = [r for r in response.data if str(r['id']) != item_id]
         return {"source_id": item_id, "recommendations": results[:limit]}
     except Exception as e:
@@ -159,4 +124,5 @@ async def get_content_recommendations(item_id: str, type: str = "movie", limit: 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
+    # Note: Use 'api.main:app' as a string for production workers
     uvicorn.run("api.main:app", host="0.0.0.0", port=port, log_level="info")

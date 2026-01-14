@@ -3,6 +3,7 @@ import requests
 import time
 import logging
 from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer
 
 # Set up logging for GitHub Actions output
 logging.basicConfig(level=logging.INFO)
@@ -12,55 +13,27 @@ logger = logging.getLogger(__name__)
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
 
-# 2. Initialize Supabase
+# 2. Initialize Clients
+# We use local inference here because GitHub Actions has ~7GB of RAM,
+# which is plenty for the 'all-MiniLM-L6-v2' model.
+logger.info("Loading Local ML Embedding Model (all-MiniLM-L6-v2)...")
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 def get_embedding(text: str):
     """
-    Calls Hugging Face Inference API for embeddings with aggressive retry logic.
-    Ensures that large data syncs don't fail just because the model is cold.
+    Generates embeddings locally using sentence-transformers.
+    No API calls required, ensuring 100% reliability during sync.
     """
-    if not HF_TOKEN:
-        logger.error("HF_TOKEN is missing! Cannot generate embeddings.")
+    try:
+        # Generate 384-dimensional embedding
+        embedding = model.encode(text).tolist()
+        return embedding
+    except Exception as e:
+        logger.error(f"Local Embedding Error: {e}")
         return None
-
-    model_id = "sentence-transformers/all-MiniLM-L6-v2"
-    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_id}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    
-    # Increased to 7 retries for a total possible wait time of ~90 seconds
-    for i in range(7):
-        try:
-            response = requests.post(
-                api_url, 
-                headers=headers, 
-                json={"inputs": text, "options": {"wait_for_model": True}}, 
-                timeout=45
-            )
-            
-            if response.status_code == 200:
-                vector = response.json()
-                # FLATTENING LOGIC: Ensure we have a flat list of 384 floats
-                if isinstance(vector, list):
-                    while len(vector) > 0 and isinstance(vector[0], list):
-                        vector = vector[0]
-                    return vector
-                return vector
-            elif response.status_code == 503:
-                # Exponential backoff: 5s, 10s, 15s...
-                wait_time = (i + 1) * 5
-                logger.info(f"AI Engine warming up (Attempt {i+1}/7). Waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"HF Error: {response.status_code} - {response.text}")
-                break
-        except Exception as e:
-            logger.error(f"Embedding Request Error on attempt {i+1}: {e}")
-            time.sleep(2)
-    return None
 
 def get_indian_movies(total_target=2100):
     """Fetch a massive collection of Indian movies across regions to reach 2000+ rows"""
@@ -146,15 +119,14 @@ def run_sync():
     # --- Process Movies ---
     movie_candidates = get_indian_movies(total_target=2200) 
     synced_movies = 0
-    logger.info(f"Total movie candidates fetched: {len(movie_candidates)}. Starting vector processing...")
+    logger.info(f"Total movie candidates fetched: {len(movie_candidates)}. Starting local vector processing...")
     
     for m in movie_candidates:
         try:
             if not m.get('overview') or not m.get('title'):
                 continue
             
-            # Limit text to roughly 2000 chars for the embedding model
-            text_content = f"{m['title']}. {m.get('overview', '')}"[:2000]
+            text_content = f"{m['title']}. {m.get('overview', '')}"
             embedding = get_embedding(text_content)
             
             if not embedding:
@@ -184,7 +156,7 @@ def run_sync():
     # --- Process Books ---
     book_items = get_global_books(items_per_query=120)
     synced_books = 0
-    logger.info(f"Total book candidates fetched: {len(book_items)}. Starting vector processing...")
+    logger.info(f"Total book candidates fetched: {len(book_items)}. Starting local vector processing...")
     
     for b in book_items:
         try:
@@ -193,7 +165,7 @@ def run_sync():
             if not description or not vol.get('title'):
                 continue
 
-            text_content = f"{vol.get('title')}. {description}"[:2000]
+            text_content = f"{vol.get('title')}. {description}"
             embedding = get_embedding(text_content)
             
             if not embedding:
@@ -223,7 +195,6 @@ if __name__ == "__main__":
     if not TMDB_API_KEY: missing.append("TMDB_API_KEY")
     if not SUPABASE_URL: missing.append("SUPABASE_URL")
     if not SUPABASE_KEY: missing.append("SUPABASE_KEY")
-    if not HF_TOKEN: missing.append("HF_TOKEN")
 
     if missing:
         logger.error(f"FAILED TO START: Missing secrets in environment: {', '.join(missing)}")
