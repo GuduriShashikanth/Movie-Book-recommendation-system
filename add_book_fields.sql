@@ -13,14 +13,17 @@ CREATE INDEX IF NOT EXISTS idx_books_language ON books(language);
 CREATE INDEX IF NOT EXISTS idx_books_categories ON books(categories);
 CREATE INDEX IF NOT EXISTS idx_books_published ON books(published_date);
 
--- Update the match_books function to include new fields
+-- Drop the old function first
+DROP FUNCTION IF EXISTS match_books(vector, double precision, integer);
+
+-- Recreate the match_books function with new fields (using uuid for id)
 CREATE OR REPLACE FUNCTION match_books(
   query_embedding vector(384),
   match_threshold float,
   match_count int
 )
 RETURNS TABLE (
-  id bigint,
+  id uuid,
   google_id text,
   title text,
   authors text,
