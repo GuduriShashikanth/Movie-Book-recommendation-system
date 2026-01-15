@@ -42,6 +42,18 @@ class InteractionCreate(BaseModel):
     item_id: str  # UUID as string
     item_type: str = Field(..., pattern="^(movie|book)$")
     interaction_type: str = Field(..., pattern="^(view|click|search)$")
+    
+    class Config:
+        # Ensure strings are not coerced from numbers
+        str_strip_whitespace = True
+        
+    def __init__(self, **data):
+        # Convert any numeric values to strings and validate
+        if 'item_type' in data and not isinstance(data['item_type'], str):
+            data['item_type'] = str(data['item_type'])
+        if 'interaction_type' in data and not isinstance(data['interaction_type'], str):
+            data['interaction_type'] = str(data['interaction_type'])
+        super().__init__(**data)
 
 class InteractionResponse(BaseModel):
     id: int
