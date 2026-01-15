@@ -41,4 +41,4 @@ jobs:
           MOVIE_TARGET: ${{ github.event.inputs.movie_target || '10000' }}
           BOOK_TARGET: ${{ github.event.inputs.book_target || '5000' }}
         run: python api/sync_engine.py
-        timeout-minutes: 120  # 2 hour timeout for large syncs
+        timeout-minutes: 240  # 2 hour timeout for large syncs

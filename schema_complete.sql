@@ -1,17 +1,11 @@
--- CineLibre Database Migration Script
--- Run this to update existing database with new schema
+-- CineLibre Complete Database Schema
+-- Run this ONLY for fresh database setup
+-- For existing databases, use migrations.sql instead
 
--- ==================== DROP EXISTING FUNCTIONS ====================
--- Drop old functions if they exist
+-- Enable pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
 
-DROP FUNCTION IF EXISTS match_movies(vector, double precision, integer);
-DROP FUNCTION IF EXISTS match_books(vector, double precision, integer);
-DROP FUNCTION IF EXISTS get_popular_items(integer);
-DROP FUNCTION IF EXISTS get_collaborative_recommendations(bigint, integer);
-
--- ==================== CREATE/UPDATE TABLES ====================
-
--- Users table (create if not exists)
+-- ==================== USERS TABLE ====================
 CREATE TABLE IF NOT EXISTS users (
   id BIGSERIAL PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
@@ -23,8 +17,51 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
--- Ratings table (create if not exists)
--- Note: item_id is stored as UUID (matching movies/books tables)
+-- ==================== MOVIES TABLE ====================
+CREATE TABLE IF NOT EXISTS movies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tmdb_id INTEGER UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  overview TEXT,
+  release_date DATE,
+  poster_url TEXT,
+  language TEXT,
+  director TEXT,
+  genres TEXT[],
+  "cast" JSONB,
+  crew JSONB,
+  embedding vector(384),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_movies_tmdb ON movies(tmdb_id);
+CREATE INDEX IF NOT EXISTS idx_movies_embedding ON movies USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_movies_language ON movies(language);
+CREATE INDEX IF NOT EXISTS idx_movies_director ON movies(director);
+CREATE INDEX IF NOT EXISTS idx_movies_genres ON movies USING GIN(genres);
+
+-- ==================== BOOKS TABLE ====================
+CREATE TABLE IF NOT EXISTS books (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  google_id TEXT UNIQUE NOT NULL,
+  title TEXT NOT NULL,
+  authors TEXT,
+  description TEXT,
+  thumbnail_url TEXT,
+  published_date TEXT,
+  categories TEXT,
+  language TEXT,
+  embedding vector(384),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_books_google ON books(google_id);
+CREATE INDEX IF NOT EXISTS idx_books_embedding ON books USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_books_language ON books(language);
+CREATE INDEX IF NOT EXISTS idx_books_categories ON books(categories);
+CREATE INDEX IF NOT EXISTS idx_books_published ON books(published_date);
+
+-- ==================== RATINGS TABLE ====================
 CREATE TABLE IF NOT EXISTS ratings (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -40,8 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_ratings_user ON ratings(user_id);
 CREATE INDEX IF NOT EXISTS idx_ratings_item ON ratings(item_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_ratings_created ON ratings(created_at DESC);
 
--- Interactions table (create if not exists)
--- Note: item_id is stored as UUID (matching movies/books tables)
+-- ==================== INTERACTIONS TABLE ====================
 CREATE TABLE IF NOT EXISTS interactions (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -55,16 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_interactions_user ON interactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_item ON interactions(item_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_interactions_created ON interactions(created_at DESC);
 
--- Add language column to movies if it doesn't exist
-DO $$ 
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                 WHERE table_name='movies' AND column_name='language') THEN
-    ALTER TABLE movies ADD COLUMN language TEXT;
-  END IF;
-END $$;
-
--- ==================== CREATE NEW RPC FUNCTIONS ====================
+-- ==================== RPC FUNCTIONS ====================
 
 -- Function: Match Movies (Semantic Search)
 CREATE OR REPLACE FUNCTION match_movies(
@@ -80,6 +107,8 @@ RETURNS TABLE (
   release_date date,
   poster_url text,
   language text,
+  director text,
+  genres text[],
   similarity float
 )
 LANGUAGE sql STABLE
@@ -92,6 +121,8 @@ AS $$
     release_date,
     poster_url,
     language,
+    director,
+    genres,
     1 - (embedding <=> query_embedding) AS similarity
   FROM movies
   WHERE 1 - (embedding <=> query_embedding) > match_threshold
@@ -109,8 +140,12 @@ RETURNS TABLE (
   id uuid,
   google_id text,
   title text,
+  authors text,
   description text,
   thumbnail_url text,
+  published_date text,
+  categories text,
+  language text,
   similarity float
 )
 LANGUAGE sql STABLE
@@ -119,8 +154,12 @@ AS $$
     id,
     google_id,
     title,
+    authors,
     description,
     thumbnail_url,
+    published_date,
+    categories,
+    language,
     1 - (embedding <=> query_embedding) AS similarity
   FROM books
   WHERE 1 - (embedding <=> query_embedding) > match_threshold
@@ -151,10 +190,10 @@ AS $$
       COUNT(*) as rating_count,
       m.poster_url
     FROM ratings r
-    JOIN movies m ON r.item_id::uuid = m.id
+    JOIN movies m ON r.item_id = m.id
     WHERE r.item_type = 'movie'
     GROUP BY r.item_id, m.title, m.poster_url
-    HAVING COUNT(*) >= 5
+    HAVING COUNT(*) >= 1
   ),
   book_ratings AS (
     SELECT 
@@ -165,10 +204,10 @@ AS $$
       COUNT(*) as rating_count,
       b.thumbnail_url as poster_url
     FROM ratings r
-    JOIN books b ON r.item_id::uuid = b.id
+    JOIN books b ON r.item_id = b.id
     WHERE r.item_type = 'book'
     GROUP BY r.item_id, b.title, b.thumbnail_url
-    HAVING COUNT(*) >= 5
+    HAVING COUNT(*) >= 1
   )
   SELECT * FROM (
     SELECT * FROM movie_ratings
@@ -196,13 +235,11 @@ AS $$
 BEGIN
   RETURN QUERY
   WITH user_ratings AS (
-    -- Get target user's ratings
     SELECT item_id, item_type, rating
     FROM ratings
     WHERE user_id = target_user_id
   ),
   similar_users AS (
-    -- Find users with similar taste (Pearson correlation)
     SELECT 
       r2.user_id,
       COUNT(*) as common_items,
@@ -212,12 +249,11 @@ BEGIN
     WHERE r1.user_id = target_user_id 
       AND r2.user_id != target_user_id
     GROUP BY r2.user_id
-    HAVING COUNT(*) >= 3 AND CORR(r1.rating, r2.rating) > 0.3
+    HAVING COUNT(*) >= 2 AND CORR(r1.rating, r2.rating) > 0.2
     ORDER BY similarity DESC
     LIMIT 50
   ),
   candidate_items AS (
-    -- Get items liked by similar users that target user hasn't rated
     SELECT 
       r.item_id,
       r.item_type,
@@ -229,7 +265,7 @@ BEGIN
       WHERE ur.item_id = r.item_id AND ur.item_type = r.item_type
     )
     GROUP BY r.item_id, r.item_type
-    HAVING AVG(r.rating) >= 3.5
+    HAVING AVG(r.rating) >= 3.0
   )
   SELECT 
     ci.item_id,
@@ -238,14 +274,12 @@ BEGIN
     ci.predicted_rating,
     COALESCE(m.poster_url, b.thumbnail_url) as poster_url
   FROM candidate_items ci
-  LEFT JOIN movies m ON ci.item_type = 'movie' AND ci.item_id::uuid = m.id
-  LEFT JOIN books b ON ci.item_type = 'book' AND ci.item_id::uuid = b.id
+  LEFT JOIN movies m ON ci.item_type = 'movie' AND ci.item_id = m.id
+  LEFT JOIN books b ON ci.item_type = 'book' AND ci.item_id = b.id
   ORDER BY ci.predicted_rating DESC
   LIMIT recommendation_count;
 END;
 $$;
-
--- ==================== TRIGGERS ====================
 
 -- Function: Update timestamp on row update
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -256,49 +290,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Drop existing triggers if they exist
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-DROP TRIGGER IF EXISTS update_ratings_updated_at ON ratings;
-
--- Create triggers
+-- Triggers for updated_at
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_ratings_updated_at BEFORE UPDATE ON ratings
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- ==================== VERIFICATION ====================
-
--- Verify tables exist
-DO $$
-DECLARE
-  table_count int;
-BEGIN
-  SELECT COUNT(*) INTO table_count
-  FROM information_schema.tables
-  WHERE table_schema = 'public'
-  AND table_name IN ('users', 'movies', 'books', 'ratings', 'interactions');
-  
-  RAISE NOTICE 'Tables created: %', table_count;
-END $$;
-
--- Verify functions exist
-DO $$
-DECLARE
-  function_count int;
-BEGIN
-  SELECT COUNT(*) INTO function_count
-  FROM information_schema.routines
-  WHERE routine_schema = 'public'
-  AND routine_name IN ('match_movies', 'match_books', 'get_popular_items', 'get_collaborative_recommendations');
-  
-  RAISE NOTICE 'Functions created: %', function_count;
-END $$;
-
--- Success message
-DO $$
-BEGIN
-  RAISE NOTICE '✅ Migration completed successfully!';
-  RAISE NOTICE 'Tables: users, movies, books, ratings, interactions';
-  RAISE NOTICE 'Functions: match_movies, match_books, get_popular_items, get_collaborative_recommendations';
-END $$;
