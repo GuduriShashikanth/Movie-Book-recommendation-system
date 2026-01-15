@@ -392,7 +392,10 @@ Get detailed information about a specific movie.
 
 **Authentication**: Not required
 
-**Response** (200):
+**Query Parameters**:
+- `include_details` (optional): If `true`, fetches cast, crew, and genres from TMDB (default: `false`)
+
+**Response** (200) - Basic:
 ```json
 {
   "id": "ff0b9d75-3b2f-403a-ab5b-1f18ab5e108f",
@@ -404,6 +407,44 @@ Get detailed information about a specific movie.
   "language": "en",
   "created_at": "2026-01-11T06:56:55Z"
 }
+```
+
+**Response** (200) - With Details (`include_details=true`):
+```json
+{
+  "id": "ff0b9d75-3b2f-403a-ab5b-1f18ab5e108f",
+  "tmdb_id": 1479090,
+  "title": "Movie Title",
+  "overview": "Movie description...",
+  "release_date": "2025-06-13",
+  "poster_url": "https://image.tmdb.org/t/p/w500/...",
+  "language": "en",
+  "genres": ["Action", "Thriller", "Drama"],
+  "cast": [
+    {
+      "name": "Actor Name",
+      "character": "Character Name",
+      "profile_path": "https://image.tmdb.org/t/p/w185/..."
+    }
+  ],
+  "crew": {
+    "directors": ["Director Name"],
+    "writers": ["Writer Name"],
+    "producers": ["Producer Name"]
+  },
+  "runtime": 120,
+  "budget": 50000000,
+  "revenue": 150000000,
+  "vote_average": 7.5,
+  "vote_count": 1234,
+  "created_at": "2026-01-11T06:56:55Z"
+}
+```
+
+**Example Requests**:
+```
+GET /movies/ff0b9d75-3b2f-403a-ab5b-1f18ab5e108f
+GET /movies/ff0b9d75-3b2f-403a-ab5b-1f18ab5e108f?include_details=true
 ```
 
 ---

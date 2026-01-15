@@ -146,6 +146,11 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 
 # ==================== RATING ENDPOINTS ====================
 
+@app.options("/ratings")
+async def ratings_options():
+    """Handle CORS preflight for ratings endpoint"""
+    return {"message": "OK"}
+
 @app.post("/ratings", response_model=RatingResponse)
 async def create_rating(
     rating_data: RatingCreate,
@@ -194,6 +199,11 @@ async def delete_rating(
 
 # ==================== INTERACTION TRACKING ====================
 
+@app.options("/interactions")
+async def interactions_options():
+    """Handle CORS preflight for interactions endpoint"""
+    return {"message": "OK"}
+
 @app.post("/interactions")
 async def track_interaction(
     interaction: InteractionCreate,
@@ -218,7 +228,7 @@ async def semantic_search(
     limit: int = 12,
     threshold: float = 0.4
 ):
-    """Semantic search - no authentication required"""
+    """Semantic search with TMDB fallback - no authentication required"""
     m = get_model()
     db = get_db()
     if not m or not db:
@@ -236,10 +246,114 @@ async def semantic_search(
             "match_count": limit
         }).execute()
         
-        return {"query": q, "results": response.data}
+        # If no results found in DB and searching for movies, try TMDB
+        if (not response.data or len(response.data) == 0) and type == "movie":
+            logger.info(f"No results in DB for '{q}', searching TMDB...")
+            tmdb_results = await search_tmdb_and_add(q, limit, db, m)
+            if tmdb_results:
+                return {"query": q, "results": tmdb_results, "source": "tmdb"}
+        
+        return {"query": q, "results": response.data, "source": "database"}
     except Exception as e:
         logger.error(f"Search Error: {e}")
         raise HTTPException(status_code=500, detail="Search processing failed.")
+
+async def search_tmdb_and_add(query: str, limit: int, db, model):
+    """Search TMDB, add results to DB, and return them"""
+    import os
+    import requests
+    
+    tmdb_api_key = os.getenv("TMDB_API_KEY")
+    if not tmdb_api_key:
+        logger.error("TMDB API key not configured")
+        return []
+    
+    try:
+        # Search TMDB
+        url = "https://api.themoviedb.org/3/search/movie"
+        params = {
+            "api_key": tmdb_api_key,
+            "query": query,
+            "language": "en-US",
+            "page": 1,
+            "include_adult": False
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code != 200:
+            return []
+        
+        data = response.json()
+        results = data.get("results", [])[:limit]
+        
+        if not results:
+            return []
+        
+        # Add movies to database and return formatted results
+        added_movies = []
+        
+        for movie in results:
+            if not movie.get("overview") or not movie.get("title"):
+                continue
+            
+            try:
+                # Check if movie already exists
+                existing = db.table("movies").select("id, tmdb_id, title, overview, poster_url, language").eq("tmdb_id", movie["id"]).execute()
+                
+                if existing.data:
+                    # Movie exists, return it
+                    added_movies.append({
+                        "id": existing.data[0]["id"],
+                        "tmdb_id": existing.data[0]["tmdb_id"],
+                        "title": existing.data[0]["title"],
+                        "overview": existing.data[0]["overview"],
+                        "poster_url": existing.data[0]["poster_url"],
+                        "language": existing.data[0]["language"],
+                        "similarity": 0.9,  # High similarity since it's a direct search match
+                        "release_date": movie.get("release_date")
+                    })
+                else:
+                    # Generate embedding for the movie
+                    text = f"{movie['title']}. {movie['overview']}"
+                    embeddings = list(model.embed([text[:2000]]))
+                    vector = embeddings[0].tolist()
+                    
+                    # Add to database
+                    payload = {
+                        "tmdb_id": movie["id"],
+                        "title": movie["title"],
+                        "overview": movie["overview"],
+                        "release_date": movie.get("release_date"),
+                        "poster_url": f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get("poster_path") else None,
+                        "language": movie.get("original_language", "en"),
+                        "embedding": vector
+                    }
+                    
+                    result = db.table("movies").insert(payload).execute()
+                    
+                    if result.data:
+                        added_movies.append({
+                            "id": result.data[0]["id"],
+                            "tmdb_id": result.data[0]["tmdb_id"],
+                            "title": result.data[0]["title"],
+                            "overview": result.data[0]["overview"],
+                            "poster_url": result.data[0]["poster_url"],
+                            "language": result.data[0]["language"],
+                            "similarity": 0.9,
+                            "release_date": result.data[0].get("release_date")
+                        })
+                        
+                        logger.info(f"Added movie from TMDB: {movie['title']}")
+            
+            except Exception as e:
+                logger.error(f"Error adding TMDB movie: {e}")
+                continue
+        
+        return added_movies
+    
+    except Exception as e:
+        logger.error(f"TMDB search error: {e}")
+        return []
 
 # ==================== RECOMMENDATION ENDPOINTS ====================
 
@@ -460,13 +574,64 @@ async def get_popular_items(limit: int = 20):
 # ==================== MOVIE/BOOK ENDPOINTS ====================
 
 @app.get("/movies/{movie_id}")
-async def get_movie(movie_id: str):  # UUID as string
-    """Get movie details"""
+async def get_movie(movie_id: str, include_details: bool = False):
+    """Get movie details, optionally with cast/crew/genres from TMDB"""
     db = get_db()
     result = db.table("movies").select("*").eq("id", movie_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Movie not found")
-    return result.data[0]
+    
+    movie = result.data[0]
+    
+    # If include_details is True, fetch additional data from TMDB
+    if include_details and movie.get("tmdb_id"):
+        try:
+            import os
+            tmdb_api_key = os.getenv("TMDB_API_KEY")
+            if tmdb_api_key:
+                import requests
+                # Fetch movie details from TMDB
+                tmdb_url = f"https://api.themoviedb.org/3/movie/{movie['tmdb_id']}"
+                params = {
+                    "api_key": tmdb_api_key,
+                    "append_to_response": "credits"
+                }
+                response = requests.get(tmdb_url, params=params, timeout=5)
+                
+                if response.status_code == 200:
+                    tmdb_data = response.json()
+                    
+                    # Add genres
+                    movie["genres"] = [g["name"] for g in tmdb_data.get("genres", [])]
+                    
+                    # Add cast (top 10)
+                    credits = tmdb_data.get("credits", {})
+                    cast = credits.get("cast", [])[:10]
+                    movie["cast"] = [{
+                        "name": c.get("name"),
+                        "character": c.get("character"),
+                        "profile_path": f"https://image.tmdb.org/t/p/w185{c['profile_path']}" if c.get("profile_path") else None
+                    } for c in cast]
+                    
+                    # Add crew (director, writer, producer)
+                    crew = credits.get("crew", [])
+                    movie["crew"] = {
+                        "directors": [c["name"] for c in crew if c.get("job") == "Director"],
+                        "writers": [c["name"] for c in crew if c.get("department") == "Writing"][:3],
+                        "producers": [c["name"] for c in crew if c.get("job") == "Producer"][:3]
+                    }
+                    
+                    # Add runtime, budget, revenue
+                    movie["runtime"] = tmdb_data.get("runtime")
+                    movie["budget"] = tmdb_data.get("budget")
+                    movie["revenue"] = tmdb_data.get("revenue")
+                    movie["vote_average"] = tmdb_data.get("vote_average")
+                    movie["vote_count"] = tmdb_data.get("vote_count")
+        except Exception as e:
+            logger.error(f"TMDB fetch error: {e}")
+            # Continue without TMDB data
+    
+    return movie
 
 @app.get("/books/{book_id}")
 async def get_book(book_id: str):  # UUID as string
