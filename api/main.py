@@ -227,14 +227,35 @@ async def track_interaction(
                 detail=f"Invalid item_id format. Expected UUID, got: {item_id}. Please use the 'id' field from movie/book objects, not tmdb_id or other numeric IDs."
             )
         
-        result = db.table("interactions").insert({
+        # Validate item_type and interaction_type
+        if interaction.item_type not in ["movie", "book"]:
+            logger.error(f"Invalid item_type: {interaction.item_type}")
+            return {
+                "message": "Invalid item_type", 
+                "success": False, 
+                "error": f"item_type must be 'movie' or 'book', got: {interaction.item_type}"
+            }
+        
+        if interaction.interaction_type not in ["view", "click", "search"]:
+            logger.error(f"Invalid interaction_type: {interaction.interaction_type}")
+            return {
+                "message": "Invalid interaction_type", 
+                "success": False, 
+                "error": f"interaction_type must be 'view', 'click', or 'search', got: {interaction.interaction_type}"
+            }
+        
+        # Log the data being inserted for debugging
+        insert_data = {
             "user_id": current_user["user_id"],
             "item_id": item_id,
             "item_type": interaction.item_type,
             "interaction_type": interaction.interaction_type
-        }).execute()
+        }
+        logger.info(f"Inserting interaction: {insert_data}")
         
-        logger.info(f"Interaction tracked: user={current_user['user_id']}, item={item_id}, type={interaction.interaction_type}")
+        result = db.table("interactions").insert(insert_data).execute()
+        
+        logger.info(f"Interaction tracked successfully: user={current_user['user_id']}, item={item_id}, type={interaction.interaction_type}")
         return {"message": "Interaction tracked", "success": True}
     except HTTPException:
         raise
@@ -249,6 +270,15 @@ async def track_interaction(
                 "success": False, 
                 "error": "item_id must be a valid UUID (e.g., 'ff0b9d75-3b2f-403a-ab5b-1f18ab5e108f'). Use the 'id' field from movie/book objects, not 'tmdb_id'.",
                 "hint": "Make sure you're using movie.id or book.id, not movie.tmdb_id"
+            }
+        
+        # Check for constraint violations
+        if "check constraint" in error_msg.lower():
+            return {
+                "message": "Constraint violation", 
+                "success": False, 
+                "error": error_msg,
+                "hint": "Ensure item_type is 'movie' or 'book', and interaction_type is 'view', 'click', or 'search'"
             }
         
         # Return 200 but with success=false to not break frontend
