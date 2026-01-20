@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: cinelibre-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker api.main:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
+      - key: PORT
+        value: 10000
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: TMDB_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: GOOGLE_BOOKS_API_KEY
+        sync: false
